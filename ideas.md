@@ -2,7 +2,6 @@
 
 - minecraft modding (stupid idea, we will never do this)
 - mods for other games (also lame and stupid)
-- some app
 - google docs but for programming (not doing this one)
 - some game (story is a requirement)
     - rouguelite (not everything lost, you have some things that save across games)
