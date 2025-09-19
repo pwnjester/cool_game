@@ -1,19 +1,12 @@
 #include <stdio.h>
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
 #include "./constants.h"
 
-typedef float    f32;
-typedef double   f64;
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-typedef int8_t   i8;
-typedef int16_t  i16;
-typedef int32_t  i32;
-typedef int64_t  i64;
-typedef size_t   usize;
-typedef ssize_t  isize;
+// TODO: i need to decide what the game loop will be
+// how the cards work
+// and how combat is going to happen
+// also learn how to use sdl
 
 int game_is_running = FALSE;
 SDL_Window* window = NULL;
@@ -21,33 +14,35 @@ SDL_Renderer* renderer = NULL;
 
 int last_frame_time = 0;
 
-struct rectangle {
+struct player {
     float x;
     float y;
     float width;
     float height;
-} rectangle;
+} player;
 
 int initialize_window(void) {
     if (SDL_Init(SDL_INIT_EVERYTHING) != 0) {
-        fprintf(stderr, "Error initializing STL\n");
+        fprintf(stderr, "Error initializing SDL: %s\n", SDL_GetError());
         return FALSE;
     }
     window = SDL_CreateWindow(
         NULL,
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
+        player.x,
+        player.y,
+        // SDL_WINDOWPOS_CENTERED,
+        // SDL_WINDOWPOS_CENTERED,
         WINDOW_WIDTH,
         WINDOW_HEIGHT,
         SDL_WINDOW_BORDERLESS
     );
     if (!window) {
-        fprintf(stderr, "Error creating SDL Window\n");
+        fprintf(stderr, "Error creating SDL Window: %s\n", SDL_GetError());
         return FALSE;
     }
     renderer = SDL_CreateRenderer(window, -1, 0);
     if (!renderer) {
-        fprintf(stderr, "Error creating SDL Renderer\n");
+        fprintf(stderr, "Error creating SDL Renderer: %s\n", SDL_GetError());
         return FALSE;
     }
     return TRUE;
@@ -69,10 +64,10 @@ void process_input() {
 }
 
 void setup() {
-    rectangle.x = 20;
-    rectangle.y = 20;
-    rectangle.width = 15;
-    rectangle.height = 15;
+    player.x = 20;
+    player.y = 20;
+    player.width = 20;
+    player.height = 20;
 }
 
 void update() {
@@ -81,40 +76,40 @@ void update() {
 
     last_frame_time = SDL_GetTicks();
 
-    const u8 *keystate = SDL_GetKeyboardState(NULL);
-    if (keystate[SDL_SCANCODE_LEFT]) {
-        rectangle.x -= 100 * delta_time;
+    const uint8_t *keystate = SDL_GetKeyboardState(NULL);
+    if (keystate[SDL_SCANCODE_LEFT] || keystate[SDL_SCANCODE_A]) {
+        player.x -= 100 * delta_time;
     }
 
-    if (keystate[SDL_SCANCODE_RIGHT]) {
-        rectangle.x += 100 * delta_time;
+    if (keystate[SDL_SCANCODE_RIGHT] || keystate[SDL_SCANCODE_D]) {
+        player.x += 100 * delta_time;
     }
 
-    if (keystate[SDL_SCANCODE_UP]) {
-        rectangle.y -= 100 * delta_time;
+    if (keystate[SDL_SCANCODE_UP] || keystate[SDL_SCANCODE_W]) {
+        player.y -= 100 * delta_time;
     }
 
-    if (keystate[SDL_SCANCODE_DOWN]) {
-        rectangle.y += 100 * delta_time;
+    if (keystate[SDL_SCANCODE_DOWN] || keystate[SDL_SCANCODE_S]) {
+        player.y += 100 * delta_time;
     }
-
-    // rectangle.x += 70 * delta_time;
-    // rectangle.y += 50 * delta_time;
 }
 
 void render() {
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
 
-    SDL_Rect erectangle = {
-        (int)rectangle.x,
-        (int)rectangle.y,
-        (int)rectangle.width,
-        (int)rectangle.height,
+    SDL_Rect player_info = {
+        (int)player.x,
+        (int)player.y,
+        (int)player.width,
+        (int)player.height,
     };
 
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_RenderFillRect(renderer, &erectangle);
+    player.x = (WINDOW_WIDTH - player.width) / 2;
+    player.y = (WINDOW_HEIGHT - player.height) / 2;
+
+    SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
+    SDL_RenderFillRect(renderer, &player_info);
 
     SDL_RenderPresent(renderer);
 }
