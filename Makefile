@@ -1,5 +1,5 @@
 build:
-	gcc -Wall ./src/*.c -lSDL2 -o game
+	gcc -IC:/SDL2/include -LC:/SDL2/lib -Wall ./src/*.c -lSDL2 -lSDL2_image -o game
 
 run:
 	./game
