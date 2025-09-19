@@ -2,9 +2,31 @@
 #include <SDL2/SDL.h>
 #include "./constants.h"
 
+typedef float    f32;
+typedef double   f64;
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int8_t   i8;
+typedef int16_t  i16;
+typedef int32_t  i32;
+typedef int64_t  i64;
+typedef size_t   usize;
+typedef ssize_t  isize;
+
 int game_is_running = FALSE;
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
+
+int last_frame_time = 0;
+
+struct rectangle {
+    float x;
+    float y;
+    float width;
+    float height;
+} rectangle;
 
 int initialize_window(void) {
     if (SDL_Init(SDL_INIT_EVERYTHING) != 0) {
@@ -47,16 +69,52 @@ void process_input() {
 }
 
 void setup() {
-    // TODO
+    rectangle.x = 20;
+    rectangle.y = 20;
+    rectangle.width = 15;
+    rectangle.height = 15;
 }
 
 void update() {
-    // TODO
+    // get a delta time factor for updating object position
+    float delta_time = (SDL_GetTicks() - last_frame_time) / 1000.0f;
+
+    last_frame_time = SDL_GetTicks();
+
+    const u8 *keystate = SDL_GetKeyboardState(NULL);
+    if (keystate[SDL_SCANCODE_LEFT]) {
+        rectangle.x -= 100 * delta_time;
+    }
+
+    if (keystate[SDL_SCANCODE_RIGHT]) {
+        rectangle.x += 100 * delta_time;
+    }
+
+    if (keystate[SDL_SCANCODE_UP]) {
+        rectangle.y -= 100 * delta_time;
+    }
+
+    if (keystate[SDL_SCANCODE_DOWN]) {
+        rectangle.y += 100 * delta_time;
+    }
+
+    // rectangle.x += 70 * delta_time;
+    // rectangle.y += 50 * delta_time;
 }
 
 void render() {
-    SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
+
+    SDL_Rect erectangle = {
+        (int)rectangle.x,
+        (int)rectangle.y,
+        (int)rectangle.width,
+        (int)rectangle.height,
+    };
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_RenderFillRect(renderer, &erectangle);
 
     SDL_RenderPresent(renderer);
 }
