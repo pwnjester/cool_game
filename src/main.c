@@ -10,7 +10,7 @@
 #include "./constants.h"
 
 // TODO:
-// i want to add npcs and figure out how the the story will progress (dialog)
+// i want to fix the parsing of meta files (for each level)
 // i want to build the combat system and make some cards and inventory items
 // i want to add lighting
 
