@@ -1,0 +1,4 @@
+# Format: row,col: options
+# rows and cols are 0-based (top-left is 0,0)
+# Example: make the A at row 2,col 2 hostile with HP and a drop
+2,2: hostile,hp=20,drop=C01,lvl=1,say="*I* am the alpha"

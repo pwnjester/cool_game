@@ -5,6 +5,8 @@
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <math.h>
 #include "./constants.h"
 
 // TODO:
@@ -35,8 +37,6 @@ struct player {
 } player;
 
 // --- Inventory / Items ---
-#define CARD_SLOTS 5
-#define OTHER_SLOTS 10
 
 typedef enum { ITEM_CARD, ITEM_WEAPON, ITEM_CONSUMABLE } ItemType;
 
@@ -68,6 +68,44 @@ static int player_defense_pct = 0; // 0-100 percent damage reduction
 // rendering scale (zoom)
 static float render_scale = 1.0f;
 static int game_over = 0;
+
+// dropped items on the ground
+typedef struct {
+    char id[8];
+    float x, y;
+    SDL_Texture* tex;
+    int stack;
+    int exists;
+} Drop;
+
+static Drop drops[MAX_DROPS];
+static int drop_count = 0;
+
+// simple HUD message system
+typedef struct { char text[128]; float timer; } HudMsg;
+static HudMsg hud_msgs[HUD_MSG_MAX];
+static int hud_count = 0;
+
+static void add_hud_message(const char *fmt, ...) {
+    if (hud_count >= (int)(sizeof(hud_msgs)/sizeof(hud_msgs[0]))) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(hud_msgs[hud_count].text, sizeof(hud_msgs[hud_count].text), fmt, ap);
+    va_end(ap);
+    hud_msgs[hud_count].timer = 2.5f; // seconds
+    hud_count++;
+}
+
+// forward decl to avoid implicit declaration
+static SDL_Texture* load_texture_for_token(const char* token);
+
+static void spawn_drop(const char *id, float x, float y) {
+    if (drop_count >= (int)(sizeof(drops)/sizeof(drops[0]))) return;
+    Drop *d = &drops[drop_count++];
+    strncpy(d->id, id, sizeof(d->id)-1); d->id[sizeof(d->id)-1] = '\0';
+    d->x = x; d->y = y; d->stack = 1; d->exists = 1;
+    // try load texture for token (item id)
+    d->tex = load_texture_for_token(d->id);
+}
 
 // small 3x5 bitmap font for 0-9 and a few letters (H,P,C,W)
 // each entry is 5 rows of 3 bits (LSB is rightmost pixel)
@@ -135,11 +173,14 @@ static void draw_char_small(int x, int y, int scale, SDL_Color color, char ch) {
 static void draw_string_small(int x, int y, int scale, SDL_Color color, const char *s) {
     int ox = x;
     while (*s) {
-        if (*s == ' ') { ox += (3+1)*scale; s++; continue; }
+        if (*s == ' ') { ox += (3 + 1) * scale; s++; continue; }
         draw_char_small(ox, y, scale, color, *s);
-        ox += (3+1)*scale; s++;
+        ox += (3 + 1) * scale; s++;
     }
 }
+
+// helper: draw TTF text at given position (size param chooses font size via TTF_OpenFont if needed)
+// draw_text_ttf is defined after ui_font to avoid forward reference issues
 
 // helper: clear an Item slot
 static void clear_item(Item *it) {
@@ -214,16 +255,99 @@ static SDL_Texture* ui_card_placeholder = NULL;
 static SDL_Texture* ui_item_placeholder = NULL;
 static TTF_Font* ui_font = NULL;
 
+// draw TTF text using the loaded `ui_font`, fallback to bitmap font when not available
+static void draw_text_ttf(int x, int y, const char *text, SDL_Color color) {
+    if (!ui_font) { draw_string_small(x, y, 3, color, text); return; }
+    SDL_Surface* surf = TTF_RenderText_Blended(ui_font, text, color);
+    if (!surf) return;
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+    SDL_FreeSurface(surf);
+    if (!tex) return;
+    int w=0,h=0; SDL_QueryTexture(tex, NULL, NULL, &w, &h);
+    SDL_Rect dst = { x, y, w, h };
+    SDL_RenderCopy(renderer, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+}
+
 // simple NPC representation
 typedef struct {
     char id; /* letter */
     float x, y;
     float width, height;
     SDL_Texture* tex;
+    int hp;
+    int max_hp;
+    int hostile; /* 0 = neutral, 1 = hostile */
+    char drop_id[8];
+    int level_on_kill; /* how many levels to gain on kill */
+    char dialog[128];
+    float wander_timer;
+    float attack_cooldown;
+    float hit_timer;
+    float vx, vy;
+    float speed;
 } NPC;
 
-static NPC npcs[128];
+static NPC npcs[MAX_NPCS];
 static int npc_count = 0;
+static float player_hit_timer = 0.0f;
+
+// Damage popup
+typedef struct { float x,y; char txt[32]; float timer; } DmgPopup;
+static DmgPopup dmg_popups[16];
+static int dmg_popup_count = 0;
+
+static void spawn_dmg_popup(float x, float y, const char *fmt, ...) {
+    if (dmg_popup_count >= (int)(sizeof(dmg_popups)/sizeof(dmg_popups[0]))) return;
+    va_list ap; va_start(ap, fmt);
+    DmgPopup *p = &dmg_popups[dmg_popup_count++];
+    vsnprintf(p->txt, sizeof(p->txt), fmt, ap);
+    va_end(ap);
+    p->x = x; p->y = y; p->timer = 0.9f;
+}
+
+// helper: check whether an NPC at position (nx,ny) with size w/h would collide with solid tiles
+static int npc_will_collide(float nx, float ny, float w, float h) {
+    int left = (int)(nx) / TILE_SIZE;
+    int right = (int)(nx + w - 1) / TILE_SIZE;
+    int top = (int)(ny) / TILE_SIZE;
+    int bottom = (int)(ny + h - 1) / TILE_SIZE;
+    if (left < 0 || right >= level_cols || top < 0 || bottom >= level_rows) return 1;
+    for (int rr = top; rr <= bottom; ++rr) {
+        for (int cc = left; cc <= right; ++cc) {
+            if (collision_map[rr][cc]) return 1;
+        }
+    }
+    return 0;
+}
+
+// apply options string (comma-separated) to an NPC (helper reused by load_level and meta loader)
+static void apply_options_to_npc(NPC *n, const char *opts_str) {
+    if (!n || !opts_str || !opts_str[0]) return;
+    char low[128]; size_t li = 0; for (const char *pp = opts_str; *pp && li < sizeof(low)-1; ++pp) low[li++] = (char)tolower((unsigned char)*pp); low[li]='\0';
+    int looks_like_opts = 0;
+    if (strstr(low, "hostile") || strstr(low, "say=") || strchr(opts_str, ',') || strchr(opts_str, '=')) looks_like_opts = 1;
+    if (!looks_like_opts) return;
+    char opts[256]; strncpy(opts, opts_str, sizeof(opts)-1); opts[sizeof(opts)-1] = '\0';
+    char *tok2 = strtok(opts, ",");
+    while (tok2) {
+        // trim
+        size_t p = strlen(tok2); while (p>0 && (unsigned char)tok2[p-1]<32) tok2[--p]='\0';
+        while (*tok2 && (unsigned char)*tok2<33) tok2++;
+        char lowtok[128]; size_t lli=0; for (const char *pp = tok2; *pp && lli < sizeof(lowtok)-1; ++pp) lowtok[lli++] = (char)tolower((unsigned char)*pp); lowtok[lli]='\0';
+        if (strstr(lowtok, "hostile") != NULL) { n->hostile = 1; }
+        else if (strstr(lowtok, "neutral") != NULL || strstr(lowtok, "friendly") != NULL) { n->hostile = 0; }
+        else if (strncasecmp(tok2, "hp=", 3) == 0) { n->hp = n->max_hp = atoi(tok2+3); }
+        else if (strncasecmp(tok2, "drop=", 5) == 0) { strncpy(n->drop_id, tok2+5, sizeof(n->drop_id)-1); n->drop_id[sizeof(n->drop_id)-1]='\0'; }
+        else if (strncasecmp(tok2, "lvl=", 4) == 0) { n->level_on_kill = atoi(tok2+4); }
+        else if (strncasecmp(tok2, "say=", 4) == 0) {
+            char *s = tok2+4;
+            if (*s == '"') { s++; size_t sl = strlen(s); if (sl>0 && s[sl-1]=='"') s[sl-1]='\0'; }
+            strncpy(n->dialog, s, sizeof(n->dialog)-1); n->dialog[sizeof(n->dialog)-1] = '\0';
+        }
+        tok2 = strtok(NULL, ",");
+    }
+}
 
 // helper: create a solid-color texture for a token and cache it
 static SDL_Texture* create_colored_texture_for_token(const char* token, int w, int h) {
@@ -339,9 +463,27 @@ int load_level(const char* path) {
     while (r < MAX_ROWS && fgets(line, sizeof(line), f)) {
         char* p = strchr(line, '\n');
         if (p) *p = '\0';
+        // skip markdown/code-fence lines if the level file was wrapped in fences
+        // trim leading whitespace
+        char *start = line; while (*start && (unsigned char)*start <= 32) start++;
+        if (start[0] == '`' && start[1] == '`' && start[2] == '`') continue;
         int c = 0;
-        char* token = strtok(line, " \t");
-        while (token && c < MAX_COLS) {
+        char *scan = line;
+        while (c < MAX_COLS) {
+            // skip whitespace
+            while (*scan && (*scan == ' ' || *scan == '\t')) scan++;
+            if (!*scan) break;
+            char tokenbuf[512]; int ti = 0;
+            int depth = 0; // parentheses depth
+            while (*scan) {
+                if ((*scan == ' ' || *scan == '\t') && depth == 0) break;
+                if (*scan == '(') { depth++; tokenbuf[ti++] = *scan++; continue; }
+                if (*scan == ')') { if (depth>0) { tokenbuf[ti++] = *scan++; depth--; break; } else { tokenbuf[ti++] = *scan++; break; } }
+                tokenbuf[ti++] = *scan++;
+                if (ti >= (int)sizeof(tokenbuf)-1) break;
+            }
+            tokenbuf[ti] = '\0';
+            char *token = tokenbuf;
             // trim trailing control characters (e.g. '\r') from token
             size_t tlen = strlen(token);
             while (tlen > 0 && (unsigned char)token[tlen-1] < 32) {
@@ -351,6 +493,7 @@ int load_level(const char* path) {
             // support syntax like A(00) or P(00): core token before '(' and underlying tile inside
             char core[64];
             char under[TOKEN_SIZE] = "";
+            char opts_str[128] = ""; // full options string when present
             strncpy(core, token, sizeof(core)-1);
             core[sizeof(core)-1] = '\0';
             char *lp = strchr(core, '(');
@@ -358,19 +501,28 @@ int load_level(const char* path) {
                 char *rp = strchr(lp, ')');
                 if (rp && rp > lp+1) {
                     size_t ilen = (size_t)(rp - lp - 1);
-                    char inner[16];
+                    char inner[128];
                     if (ilen >= sizeof(inner)) ilen = sizeof(inner)-1;
                     strncpy(inner, lp+1, ilen);
                     inner[ilen] = '\0';
                     // trim inner
                     size_t inlen = strlen(inner);
                     while (inlen > 0 && (unsigned char)inner[inlen-1] < 32) inner[--inlen] = '\0';
-                    if (inlen > 0 && isdigit((unsigned char)inner[0])) {
-                        int v = atoi(inner);
-                        snprintf(under, TOKEN_SIZE, "%02d", v);
-                    } else {
-                        strncpy(under, inner, TOKEN_SIZE-1);
-                        under[TOKEN_SIZE-1] = '\0';
+                    // if inner starts with digits or looks like a simple tile id, treat as floor under token
+                    if (inlen > 0 && (isdigit((unsigned char)inner[0]) || (isalpha((unsigned char)inner[0]) && strlen(inner) <= 3))) {
+                        // take as under tile
+                        if (isdigit((unsigned char)inner[0])) {
+                            int v = atoi(inner);
+                            snprintf(under, TOKEN_SIZE, "%02d", v);
+                        } else {
+                            strncpy(under, inner, TOKEN_SIZE-1);
+                            under[TOKEN_SIZE-1] = '\0';
+                        }
+                    } else if (inlen > 0) {
+                        // treat as comma-separated options for NPCs: hostile, hp=##, drop=ID, lvl=#, say=...
+                        // store the full options string into opts_str (don't truncate)
+                        strncpy(opts_str, inner, sizeof(opts_str)-1);
+                        opts_str[sizeof(opts_str)-1] = '\0';
                     }
                     *lp = '\0';
                 }
@@ -423,6 +575,44 @@ int load_level(const char* path) {
                     // use a clean single-char key when loading entity texture
                     char et[2] = { core[0], '\0' };
                     n->tex = load_texture_for_token(et);
+                    // defaults
+                    n->max_hp = 10;
+                    n->hp = n->max_hp;
+                    n->hostile = 0;
+                    n->drop_id[0] = '\0';
+                    n->level_on_kill = 1;
+                    n->dialog[0] = '\0';
+                    n->wander_timer = 0.0f;
+                    n->attack_cooldown = 0.0f;
+                    n->vx = 0.0f; n->vy = 0.0f; n->speed = 20.0f;
+                    // if opts_str contains data treat as options string (full, not truncated)
+                    if (opts_str[0] != '\0') {
+                        char low[128]; size_t li = 0; for (const char *pp = opts_str; *pp && li < sizeof(low)-1; ++pp) low[li++] = (char)tolower((unsigned char)*pp); low[li]='\0';
+                        int looks_like_opts = 0;
+                        if (strstr(low, "hostile") || strstr(low, "say=") || strchr(opts_str, ',') || strchr(opts_str, '=')) looks_like_opts = 1;
+                        if (looks_like_opts) {
+                            char opts[128]; strncpy(opts, opts_str, sizeof(opts)-1); opts[sizeof(opts)-1] = '\0';
+                            char *tok2 = strtok(opts, ",");
+                            while (tok2) {
+                                // trim
+                                size_t p = strlen(tok2); while (p>0 && (unsigned char)tok2[p-1]<32) tok2[--p]='\0';
+                                while (*tok2 && (unsigned char)*tok2<33) tok2++;
+                                // robust detection: check lowercase substring
+                                char lowtok[128]; size_t lli=0; for (const char *pp = tok2; *pp && lli < sizeof(lowtok)-1; ++pp) lowtok[lli++] = (char)tolower((unsigned char)*pp); lowtok[lli]='\0';
+                                if (strstr(lowtok, "hostile") != NULL) { n->hostile = 1; }
+                                else if (strncasecmp(tok2, "hp=", 3) == 0) { n->hp = n->max_hp = atoi(tok2+3); }
+                                else if (strncasecmp(tok2, "drop=", 5) == 0) { strncpy(n->drop_id, tok2+5, sizeof(n->drop_id)-1); n->drop_id[sizeof(n->drop_id)-1]='\0'; }
+                                else if (strncasecmp(tok2, "lvl=", 4) == 0) { n->level_on_kill = atoi(tok2+4); }
+                                else if (strncasecmp(tok2, "say=", 4) == 0) {
+                                    char *s = tok2+4;
+                                    if (*s == '"') { s++; size_t sl = strlen(s); if (sl>0 && s[sl-1]=='"') s[sl-1]='\0'; }
+                                    strncpy(n->dialog, s, sizeof(n->dialog)-1);
+                                    n->dialog[sizeof(n->dialog)-1] = '\0';
+                                }
+                                tok2 = strtok(NULL, ",");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -433,7 +623,6 @@ int load_level(const char* path) {
                 }
             }
 
-            token = strtok(NULL, " \t");
             c++;
         }
         if (c > max_cols) max_cols = c;
@@ -448,6 +637,44 @@ int load_level(const char* path) {
         if (tr >= 0 && tr < MAX_ROWS && tc >= 0 && tc < MAX_COLS) {
             strncpy(level_tiles[tr][tc], "00", TOKEN_SIZE - 1);
             level_tiles[tr][tc][TOKEN_SIZE - 1] = '\0';
+        }
+    }
+    // Debug: print parsed NPCs for diagnostics
+    for (int i = 0; i < npc_count; ++i) {
+        NPC *n = &npcs[i];
+        fprintf(stdout, "NPC parsed: id=%c pos=(%d,%d) hostile=%d hp=%d drop=%s lvl=%d dialog=%s\n",
+                n->id, (int)n->x/TILE_SIZE, (int)n->y/TILE_SIZE, n->hostile, n->hp, n->drop_id, n->level_on_kill, n->dialog);
+    }
+
+    // try to read a sidecar meta file for the level (e.g. levels/level1.meta)
+    char meta_path[260]; strncpy(meta_path, path, sizeof(meta_path)-6); meta_path[sizeof(meta_path)-1] = '\0';
+    size_t plen = strlen(path);
+    if (plen > 4) {
+        snprintf(meta_path, sizeof(meta_path), "%s.meta", path);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf) {
+            char mline[256];
+            while (fgets(mline, sizeof(mline), mf)) {
+                // skip comments and blank
+                char *s = mline; while (*s && (unsigned char)*s <= 32) s++;
+                if (*s == '\0' || *s == '#') continue;
+                // expected format: x,y: OPTIONS
+                int mx=0,my=0; char *colon = strchr(s, ':');
+                if (!colon) continue;
+                *colon = '\0';
+                if (sscanf(s, "%d,%d", &my, &mx) != 2) continue;
+                char *opts = colon+1; while (*opts && (unsigned char)*opts <= 32) opts++;
+                // find NPC at tile (mx,my)
+                for (int i = 0; i < npc_count; ++i) {
+                    NPC *n = &npcs[i];
+                    int tr = (int)(n->y) / TILE_SIZE; int tc = (int)(n->x) / TILE_SIZE;
+                    if (tr == my && tc == mx) {
+                        apply_options_to_npc(n, opts);
+                        break;
+                    }
+                }
+            }
+            fclose(mf);
         }
     }
     // player
@@ -494,8 +721,14 @@ void process_input() {
                 game_is_running = FALSE;
                 break;
             case SDL_KEYDOWN:
-                if (event.key.keysym.sym == SDLK_ESCAPE)
-                    game_is_running = FALSE;
+                if (event.key.keysym.sym == SDLK_ESCAPE) game_is_running = FALSE;
+                if (event.key.keysym.sym == SDLK_e) {
+                    // store a simple event in the key state by posting a custom SDL user event
+                    SDL_PushEvent(&(SDL_Event){ .type = SDL_USEREVENT, .user = { .code = 1 } });
+                }
+                break;
+            case SDL_USEREVENT:
+                // handled in update via flag polling
                 break;
         }
     }
@@ -553,9 +786,9 @@ void setup() {
     player_level = 1;
     player_max_hp = 100 + (player_level - 1) * 20;
     player_hp = player_max_hp;
-    player_defense_pct = 5; // start with 5% damage reduction
+    player_defense_pct = 0; // start with 0% damage reduction
     // disable automatic zoom — use scale 1.0
-    render_scale = 1.0f;
+    render_scale = 1.5f;
         // initialize TTF and UI textures
         if (TTF_Init() == -1) fprintf(stderr, "TTF_Init error: %s\n", TTF_GetError());
         ui_font = TTF_OpenFont("assets/DejaVuSans.ttf", 16);
@@ -573,6 +806,9 @@ void setup() {
             ui_item_placeholder = SDL_CreateTextureFromSurface(renderer, s);
             SDL_FreeSurface(s);
         }
+    // init drops and hud
+    drop_count = 0; memset(drops, 0, sizeof(drops));
+    hud_count = 0; memset(hud_msgs, 0, sizeof(hud_msgs));
 }
 
 void update() {
@@ -589,25 +825,7 @@ void update() {
         }
         return;
     }
-    // quick debug keys to add items
-    if (keystate[SDL_SCANCODE_1]) {
-        Item it; clear_item(&it); strcpy(it.id, "C01"); it.type = ITEM_CARD; it.stack = 1; it.max_stack = 3; add_item_to_inventory(it);
-    }
-    if (keystate[SDL_SCANCODE_2]) {
-        Item it; clear_item(&it); strcpy(it.id, "W01"); it.type = ITEM_WEAPON; it.stack = 1; it.max_stack = 1; add_item_to_inventory(it);
-    }
-    if (keystate[SDL_SCANCODE_3]) {
-        Item it; clear_item(&it); strcpy(it.id, "H01"); it.type = ITEM_CONSUMABLE; it.stack = 1; it.max_stack = 5; add_item_to_inventory(it);
-    }
-    if (keystate[SDL_SCANCODE_KP_PLUS] || keystate[SDL_SCANCODE_EQUALS]) {
-        player_hp += 1; if (player_hp > player_max_hp) player_hp = player_max_hp;
-    }
-    if (keystate[SDL_SCANCODE_KP_MINUS] || keystate[SDL_SCANCODE_MINUS]) {
-        player_hp -= 1; if (player_hp < 0) player_hp = 0;
-    }
-    if (keystate[SDL_SCANCODE_L]) {
-        player_level++; player_max_hp = 100 + (player_level - 1) * 20; if (player_hp > player_max_hp) player_hp = player_max_hp;
-    }
+    // game input (movement handled below)
     float speed = 100.0f;
     float dx = 0.0f, dy = 0.0f;
     if (keystate[SDL_SCANCODE_LEFT] || keystate[SDL_SCANCODE_A]) dx -= speed * delta_time;
@@ -652,6 +870,191 @@ void update() {
     if (player_hp <= 0) {
         game_over = 1;
     }
+
+    // Player attack: space to hit nearest NPC in range
+    static int last_space = 0;
+    static int last_e = 0;
+    if (keystate[SDL_SCANCODE_SPACE]) {
+        if (!last_space) {
+            // first press: find nearest NPC within range
+            float best_dist = 999999.0f; int best_idx = -1;
+            for (int i = 0; i < npc_count; ++i) {
+                NPC *n = &npcs[i];
+                float nx = n->x + n->width/2.0f; float ny = n->y + n->height/2.0f;
+                float px = player.x + player.width/2.0f; float py = player.y + player.height/2.0f;
+                float dist = hypotf(nx-px, ny-py);
+                if (dist < 48.0f && dist < best_dist) { best_dist = dist; best_idx = i; }
+            }
+            if (best_idx >= 0) {
+                NPC *t = &npcs[best_idx];
+                // prevent killing neutral NPCs: only hostile NPCs take damage
+                if (!t->hostile) {
+                    add_hud_message("%c is neutral", t->id);
+                    // small visual feedback but no HP reduction
+                    spawn_dmg_popup(t->x + t->width/2, t->y, "0");
+                    t->hit_timer = 0.12f;
+                } else {
+                    int dmg = PLAYER_BASE_DAMAGE;
+                    t->hp -= dmg;
+                    // per-hit feedback
+                    spawn_dmg_popup(t->x + t->width/2, t->y, "-%d", dmg);
+                    t->hit_timer = 0.25f;
+                    if (t->hp <= 0) {
+                        // spawn drop on ground if specified
+                        if (t->drop_id[0] != '\0') {
+                            float dx = t->x + t->width/2.0f;
+                            float dy = t->y + t->height/2.0f;
+                            spawn_drop(t->drop_id, dx, dy);
+                            add_hud_message("Dropped: %s", t->drop_id);
+                        }
+                        // level gain for hostile kill
+                        player_level += t->level_on_kill;
+                        player_max_hp = 100 + (player_level - 1) * 20;
+                        player_hp += 10 * t->level_on_kill; if (player_hp > player_max_hp) player_hp = player_max_hp;
+                        add_hud_message("Killed %c: +%d level(s)", t->id, t->level_on_kill);
+                        // remove NPC: shift array
+                        for (int j = best_idx; j < npc_count-1; ++j) npcs[j] = npcs[j+1];
+                        npc_count--;
+                        // check remaining hostiles; if none, advance level
+                        int any_hostile = 0;
+                        for (int k = 0; k < npc_count; ++k) { if (npcs[k].hostile) { any_hostile = 1; break; } }
+                        if (!any_hostile) {
+                            add_hud_message("All hostiles defeated. Advancing level...");
+                            // reset drops and hud when moving to next level
+                            drop_count = 0; memset(drops, 0, sizeof(drops));
+                            hud_count = 0; memset(hud_msgs, 0, sizeof(hud_msgs));
+                            if (!load_level("levels/level2.txt")) {
+                                add_hud_message("No next level found");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        last_space = 1;
+    } else last_space = 0;
+
+    // Interaction: E to talk/show dialog to nearest NPC
+    if (keystate[SDL_SCANCODE_E]) {
+        if (!last_e) {
+            float best_dist = 999999.0f; int best_idx = -1;
+            for (int i = 0; i < npc_count; ++i) {
+                NPC *n = &npcs[i];
+                float nx = n->x + n->width/2.0f; float ny = n->y + n->height/2.0f;
+                float px = player.x + player.width/2.0f; float py = player.y + player.height/2.0f;
+                float dist = hypotf(nx-px, ny-py);
+                if (dist < 64.0f && dist < best_dist) { best_dist = dist; best_idx = i; }
+            }
+            if (best_idx >= 0) {
+                NPC *n = &npcs[best_idx];
+                if (n->dialog[0]) add_hud_message("%s", n->dialog);
+                else add_hud_message("%c: ...", n->id);
+            }
+        }
+        last_e = 1;
+    } else last_e = 0;
+
+    // NPC AI: wandering and hostile attacks
+    for (int i = 0; i < npc_count; ++i) {
+        NPC *n = &npcs[i];
+        // decrement timers
+        if (n->wander_timer > 0) n->wander_timer -= delta_time;
+        if (n->attack_cooldown > 0) n->attack_cooldown -= delta_time;
+        if (n->hit_timer > 0) n->hit_timer -= delta_time;
+        // wandering: pick a velocity occasionally and apply smooth motion
+        if (n->wander_timer <= 0) {
+            float ang = ((float)(rand() % 360)) * 3.14159f / 180.0f;
+            n->vx = cosf(ang) * n->speed;
+            n->vy = sinf(ang) * n->speed;
+            n->wander_timer = 0.5f + (rand()%100)/100.0f; // short bursts
+        }
+        // apply velocity with damping for smooth movement
+        float try_x = n->x + n->vx * delta_time;
+        float try_y = n->y + n->vy * delta_time;
+        // test collisions and adjust
+        if (!npc_will_collide(try_x, n->y, n->width, n->height)) n->x = try_x; else n->vx *= -0.5f;
+        if (!npc_will_collide(n->x, try_y, n->width, n->height)) n->y = try_y; else n->vy *= -0.5f;
+        // damping
+        n->vx *= 0.95f; n->vy *= 0.95f;
+        // clamp to level bounds
+    if (n->x < 0) n->x = 0;
+    if (n->y < 0) n->y = 0;
+        if (n->x > level_cols*TILE_SIZE - n->width) n->x = level_cols*TILE_SIZE - n->width;
+        if (n->y > level_rows*TILE_SIZE - n->height) n->y = level_rows*TILE_SIZE - n->height;
+
+        // hostile behavior: if player is near, attack
+        if (n->hostile) {
+            float nx = n->x + n->width/2.0f; float ny = n->y + n->height/2.0f;
+            float px = player.x + player.width/2.0f; float py = player.y + player.height/2.0f;
+            float dist = hypotf(nx-px, ny-py);
+            if (dist < 200.0f) {
+                // move toward player smoothly
+                float dirx = (px - nx); float diry = (py - ny);
+                float len = hypotf(dirx, diry); if (len > 0.001f) { dirx/=len; diry/=len; }
+                // apply to velocity so movement stays smooth and collidable
+                n->vx += dirx * 40.0f * delta_time;
+                n->vy += diry * 40.0f * delta_time;
+                // clamp speed
+                float sp = hypotf(n->vx, n->vy); if (sp > 60.0f) { n->vx = n->vx / sp * 60.0f; n->vy = n->vy / sp * 60.0f; }
+                // attack if in melee range and cooldown elapsed
+                if (dist < 34.0f && n->attack_cooldown <= 0) {
+                    int dmg = NPC_BASE_DAMAGE + (n->level_on_kill);
+                    // apply defense reduction
+                    int reduced = (int)(dmg * (100 - player_defense_pct) / 100.0f);
+                    player_hp -= reduced;
+                    // visual feedback
+                    player_hit_timer = 0.35f;
+                    spawn_dmg_popup(player.x + player.width/2, player.y, "-%d", reduced);
+                    n->attack_cooldown = 1.0f; // 1 second cooldown
+                }
+            }
+        }
+    }
+
+    // pickup check: player picks up nearby drops
+    for (int di = 0; di < drop_count; ++di) {
+        Drop *d = &drops[di];
+        if (!d->exists) continue;
+        float dx = (d->x) - (player.x + player.width/2.0f);
+        float dy = (d->y) - (player.y + player.height/2.0f);
+        float dist = hypotf(dx, dy);
+        if (dist <= PICKUP_RANGE) {
+            // try add to inventory, assume cards start with 'C'
+            Item it; clear_item(&it); strncpy(it.id, d->id, sizeof(it.id)-1);
+            if (d->id[0] == 'C') it.type = ITEM_CARD; else it.type = ITEM_WEAPON;
+            it.stack = d->stack; it.max_stack = 3; it.tex = d->tex;
+            int ok = add_item_to_inventory(it);
+            if (ok) {
+                add_hud_message("Picked up %s", d->id);
+                d->exists = 0;
+            }
+        }
+    }
+
+    // HUD message timers
+    for (int hi = 0; hi < hud_count; ++hi) {
+        if (hud_msgs[hi].timer > 0) hud_msgs[hi].timer -= delta_time;
+    }
+    // prune expired messages compactly
+    int wr = 0;
+    for (int hi = 0; hi < hud_count; ++hi) {
+        if (hud_msgs[hi].timer > 0) { if (wr != hi) hud_msgs[wr] = hud_msgs[hi]; wr++; }
+    }
+    hud_count = wr;
+
+    // decrement hit timers and update damage popups
+    if (player_hit_timer > 0) player_hit_timer -= delta_time;
+    for (int pi = 0; pi < dmg_popup_count; ++pi) {
+        DmgPopup *p = &dmg_popups[pi];
+        if (p->timer > 0) {
+            p->y -= 20.0f * delta_time;
+            p->timer -= delta_time;
+        }
+    }
+    // compact expired dmg popups
+    int wp = 0;
+    for (int pi = 0; pi < dmg_popup_count; ++pi) if (dmg_popups[pi].timer > 0) { if (wp != pi) dmg_popups[wp] = dmg_popups[pi]; wp++; }
+    dmg_popup_count = wp;
 }
 
 void render() {
@@ -674,8 +1077,13 @@ void render() {
     for (int i = 0; i < npc_count; ++i) {
     NPC *n = &npcs[i];
     SDL_Rect nd = { level_offset_x + (int)n->x, level_offset_y + (int)n->y, (int)n->width, (int)n->height };
-        if (n->tex) SDL_RenderCopy(renderer, n->tex, NULL, &nd);
-        else {
+        if (n->tex) {
+            if (n->hit_timer > 0) {
+                SDL_SetTextureColorMod(n->tex, 255, 100, 100);
+                SDL_RenderCopy(renderer, n->tex, NULL, &nd);
+                SDL_SetTextureColorMod(n->tex, 255,255,255);
+            } else SDL_RenderCopy(renderer, n->tex, NULL, &nd);
+        } else {
             // draw fallback colored rect per id
             char key[2] = { n->id, '\0' };
             SDL_Texture* ft = cache_lookup(key);
@@ -685,6 +1093,22 @@ void render() {
             }
             if (ft) SDL_RenderCopy(renderer, ft, NULL, &nd);
         }
+    }
+
+    // damage popups
+    for (int pi = 0; pi < dmg_popup_count; ++pi) {
+        DmgPopup *p = &dmg_popups[pi];
+        SDL_Color col = {255,220,160,255};
+        draw_text_ttf(level_offset_x + (int)p->x - 8, level_offset_y + (int)p->y, p->txt, col);
+    }
+
+    // render drops on ground
+    for (int di = 0; di < drop_count; ++di) {
+        Drop *d = &drops[di];
+        if (!d->exists) continue;
+        SDL_Rect dd = { level_offset_x + (int)(d->x - TILE_SIZE/2), level_offset_y + (int)(d->y - TILE_SIZE/2), TILE_SIZE, TILE_SIZE };
+        SDL_Texture* dt = d->tex ? d->tex : ui_item_placeholder;
+        if (dt) SDL_RenderCopy(renderer, dt, NULL, &dd);
     }
 
     SDL_Rect dst = { level_offset_x + (int)player.x, level_offset_y + (int)player.y, (int)player.width, (int)player.height };
@@ -698,7 +1122,11 @@ void render() {
         case DIR_DOWN: default: use_tex = player_tex; break;
     }
     if (use_tex) {
-        SDL_RenderCopy(renderer, use_tex, NULL, &dst);
+        if (player_hit_timer > 0) {
+            SDL_SetTextureColorMod(use_tex, 255, 120, 120);
+            SDL_RenderCopy(renderer, use_tex, NULL, &dst);
+            SDL_SetTextureColorMod(use_tex, 255,255,255);
+        } else SDL_RenderCopy(renderer, use_tex, NULL, &dst);
     } else {
         SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
         SDL_RenderFillRect(renderer, &dst);
@@ -723,7 +1151,6 @@ void render() {
     SDL_RenderFillRect(renderer, &portrait);
     // draw player texture inside portrait (scaled to fit)
     if (player_tex) {
-        SDL_Rect src = { 0,0, (int)player.width, (int)player.height };
         SDL_RenderCopy(renderer, player_tex, NULL, &portrait);
     } else if (fallback_player) {
         SDL_RenderCopy(renderer, fallback_player, NULL, &portrait);
@@ -740,7 +1167,8 @@ void render() {
     SDL_RenderFillRect(renderer, &hp_bg);
     // fill based on hp percentage
     float hp_pct = (player_max_hp > 0) ? ((float)player_hp / (float)player_max_hp) : 0.0f;
-    if (hp_pct < 0) hp_pct = 0; if (hp_pct > 1) hp_pct = 1;
+    if (hp_pct < 0) hp_pct = 0;
+    if (hp_pct > 1) hp_pct = 1;
     SDL_Rect hp_fill = { hp_x + 1, hp_y + 1, (int)((hp_w - 2) * hp_pct), hp_h - 2 };
     SDL_SetRenderDrawColor(renderer, 180, 40, 40, 255);
     SDL_RenderFillRect(renderer, &hp_fill);
@@ -765,20 +1193,20 @@ void render() {
 
     // defense and level under the HP bar
     char defbuf[32]; snprintf(defbuf, sizeof(defbuf), "DEF: %d%%", player_defense_pct);
+    draw_text_ttf(hp_x, hp_y + hp_h + 8, defbuf, white);
     char lvbuf[32]; snprintf(lvbuf, sizeof(lvbuf), "LVL: %d", player_level);
-    draw_string_small(hp_x, hp_y + hp_h + 8, 2, white, defbuf);
-    draw_string_small(hp_x + 110, hp_y + hp_h + 8, 2, white, lvbuf);
+    draw_text_ttf(hp_x + 110, hp_y + hp_h + 8, lvbuf, white);
 
     // separator line
     SDL_SetRenderDrawColor(renderer, 70,70,80,255);
     SDL_Rect sep = { ui_x + pad, ui_y + pad + portrait_s + 12, panel.w - pad*2, 2 };
     SDL_RenderFillRect(renderer, &sep);
 
-    // CARDS: spread across a single centered row with large icons
-    draw_string_small(ui_x + pad, sep.y + 12, 2, white, "CARDS");
+    // CARDS: spread across a single centered row with larger but fitting icons
+    draw_text_ttf(ui_x + pad, sep.y + 12, "CARDS", white);
     int cards_y = sep.y + 36;
-    int card_w = 56;
-    int card_gap = 12;
+    int card_w = 52;
+    int card_gap = 8;
     int total_cards_w = CARD_SLOTS * card_w + (CARD_SLOTS - 1) * card_gap;
     int start_x = ui_x + (panel.w - total_cards_w) / 2;
     for (int i = 0; i < CARD_SLOTS; ++i) {
@@ -805,7 +1233,7 @@ void render() {
 
     // ITEMS: grid below cards
     int items_y = cards_y + card_w + 24;
-    draw_string_small(ui_x + pad, items_y, 2, white, "ITEMS");
+    draw_text_ttf(ui_x + pad, items_y, "ITEMS", white);
     int grid_y = items_y + 20;
     int item_w = 48; int item_gap = 10; int cols = 5;
     for (int i = 0; i < OTHER_SLOTS; ++i) {
@@ -841,6 +1269,14 @@ void render() {
         draw_string_small(WINDOW_WIDTH/2 - 24, WINDOW_HEIGHT/2 + 16, 2, white, "Press Enter to restart");
     }
 
+    // HUD messages (top-center)
+    for (int hi = 0; hi < hud_count; ++hi) {
+        int sx = WINDOW_WIDTH/2 - 200/2;
+        int sy = 10 + hi * 22;
+        SDL_Color col = {255,255,200,255};
+        draw_text_ttf(sx, sy, hud_msgs[hi].text, col);
+    }
+
     SDL_RenderPresent(renderer);
 }
 
@@ -870,6 +1306,7 @@ void destroy_window() {
     // destroy item textures
     for (int i = 0; i < CARD_SLOTS; ++i) if (cardInv.slots[i].tex) SDL_DestroyTexture(cardInv.slots[i].tex);
     for (int i = 0; i < OTHER_SLOTS; ++i) if (otherInv.slots[i].tex) SDL_DestroyTexture(otherInv.slots[i].tex);
+    for (int di = 0; di < drop_count; ++di) if (drops[di].tex) SDL_DestroyTexture(drops[di].tex);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     IMG_Quit();
