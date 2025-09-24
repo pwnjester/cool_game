@@ -395,7 +395,7 @@ int initialize_window(void) {
         fprintf(stderr, "Error creating SDL Renderer: %s\n", SDL_GetError());
         return FALSE;
     }
-    
+
     last_frame_time = SDL_GetTicks();
 
     return TRUE;
