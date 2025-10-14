@@ -618,7 +618,7 @@ int load_level(const char* path) {
 
             // collision: check floor_token (normalized)
             if (isdigit((unsigned char)floor_token[0])) {
-                if (strcmp(floor_token, "01") == 0 || strcmp(floor_token, "02") == 0||strcmp(floor_token, "03") == 0) {
+                if (strcmp(floor_token, "01") == 0 || strcmp(floor_token, "02") == 0||strcmp(floor_token, "04") == 0){
                     collision_map[r][c] = 1;
                 }
             }
