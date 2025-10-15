@@ -24,3 +24,4 @@
 	- `say="..."` — dialog string shown when interacting
 
 Example: `A(hostile,hp=12,drop=C02,lvl=1,say="You'll regret this!")`
+doesnt work rn though
